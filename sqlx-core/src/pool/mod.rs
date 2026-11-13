@@ -75,7 +75,7 @@ pub use self::connection::PoolConnection;
 use self::inner::PoolInner;
 #[doc(hidden)]
 pub use self::maybe::MaybePoolConnection;
-pub use self::options::{PoolConnectionMetadata, PoolOptions};
+pub use self::options::{IdleOrder, PoolConnectionMetadata, PoolOptions};
 
 #[macro_use]
 mod executor;
@@ -84,6 +84,7 @@ mod executor;
 pub mod maybe;
 
 mod connection;
+mod idle;
 mod inner;
 mod options;
 

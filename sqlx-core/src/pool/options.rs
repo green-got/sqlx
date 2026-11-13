@@ -83,6 +83,7 @@ pub struct PoolOptions<DB: Database> {
     pub(crate) max_lifetime: Option<Duration>,
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) fair: bool,
+    pub(crate) idle_order: IdleOrder,
 
     pub(crate) parent_pool: Option<Pool<DB>>,
 }
@@ -106,9 +107,21 @@ impl<DB: Database> Clone for PoolOptions<DB> {
             max_lifetime: self.max_lifetime,
             idle_timeout: self.idle_timeout,
             fair: self.fair,
+            idle_order: self.idle_order,
             parent_pool: self.parent_pool.clone(),
         }
     }
+}
+
+/// The order in which a pool hands out its idle connections; see [`PoolOptions::idle_order`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdleOrder {
+    /// Hand out the connection that has been idle the longest.
+    #[default]
+    Fifo,
+    /// Hand out the most recently released connection.
+    Lifo,
 }
 
 /// Metadata for the connection being processed by a [`PoolOptions`] callback.
@@ -161,6 +174,7 @@ impl<DB: Database> PoolOptions<DB> {
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(30 * 60)),
             fair: true,
+            idle_order: IdleOrder::Fifo,
             parent_pool: None,
         }
     }
@@ -305,6 +319,27 @@ impl<DB: Database> PoolOptions<DB> {
     /// Get the maximum idle duration for individual connections.
     pub fn get_idle_timeout(&self) -> Option<Duration> {
         self.idle_timeout
+    }
+
+    /// Set the order in which idle connections are handed out.
+    ///
+    /// Defaults to [`IdleOrder::Fifo`].
+    ///
+    /// With FIFO, every idle connection keeps getting used while there is any traffic, so a pool
+    /// that grew for a burst stays at that size until [`max_lifetime`] closes its connections.
+    /// With [`IdleOrder::Lifo`], steady traffic runs on as few connections as it needs, and the
+    /// rest stay idle long enough for [`idle_timeout`] to close them.
+    ///
+    /// [`max_lifetime`]: Self::max_lifetime
+    /// [`idle_timeout`]: Self::idle_timeout
+    pub fn idle_order(mut self, order: IdleOrder) -> Self {
+        self.idle_order = order;
+        self
+    }
+
+    /// Get the order in which idle connections are handed out.
+    pub fn get_idle_order(&self) -> IdleOrder {
+        self.idle_order
     }
 
     /// If true, the health of a connection will be verified by a call to [`Connection::ping`]
@@ -590,6 +625,7 @@ impl<DB: Database> Debug for PoolOptions<DB> {
             .field("connect_timeout", &self.acquire_timeout)
             .field("max_lifetime", &self.max_lifetime)
             .field("idle_timeout", &self.idle_timeout)
+            .field("idle_order", &self.idle_order)
             .field("test_before_acquire", &self.test_before_acquire)
             .finish()
     }
