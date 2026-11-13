@@ -2,7 +2,9 @@ use super::connection::Idle;
 use crate::database::Database;
 use crate::pool::IdleOrder;
 use crossbeam_queue::ArrayQueue;
+use std::cmp;
 use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 
 /// The pool's idle connections, handed out in the pool's [`IdleOrder`].
 // There is one per pool, so the size of `ArrayQueue`'s cache-padded indices does not matter.
@@ -53,28 +55,45 @@ impl<DB: Database> IdleQueue<DB> {
         }
     }
 
-    /// Takes a connection for which `is_expired` holds, without changing when any connection
-    /// counts as idle from.
+    /// Takes a connection whose `expires_at` has passed, without changing when any connection
+    /// counts as idle from. Otherwise returns the earliest `expires_at` among the connections
+    /// it checked, if any.
     ///
     /// FIFO checks only the connection at the head, moving it to the tail if it has not expired,
     /// so `n` calls visit the `n` longest-idle connections. LIFO takes the longest-idle expired
     /// connection and leaves the order of the rest untouched.
-    pub(super) fn pop_expired(&self, is_expired: impl Fn(&Idle<DB>) -> bool) -> Option<Idle<DB>> {
+    pub(super) fn pop_expired(
+        &self,
+        expires_at: impl Fn(&Idle<DB>) -> Option<Instant>,
+    ) -> Result<Idle<DB>, Option<Instant>> {
+        let now = Instant::now();
+
         match self {
             Self::Fifo(queue) => {
-                let idle = queue.pop()?;
-                if is_expired(&idle) {
-                    return Some(idle);
+                let idle = queue.pop().ok_or(None)?;
+                let expiry = expires_at(&idle);
+                if expiry.is_some_and(|expiry| expiry <= now) {
+                    return Ok(idle);
                 }
                 if queue.push(idle).is_err() {
                     panic!("BUG: connection queue overflow in pop_expired()");
                 }
-                None
+                Err(expiry)
             }
             Self::Lifo { stack, .. } => {
                 let mut stack = stack.lock().unwrap_or_else(PoisonError::into_inner);
-                let index = stack.iter().position(is_expired)?;
-                Some(stack.remove(index))
+                let mut next_expiry = None;
+                for (index, idle) in stack.iter().enumerate() {
+                    match expires_at(idle) {
+                        Some(expiry) if expiry <= now => return Ok(stack.remove(index)),
+                        Some(expiry) => {
+                            next_expiry =
+                                Some(next_expiry.map_or(expiry, |next| cmp::min(expiry, next)))
+                        }
+                        None => {}
+                    }
+                }
+                Err(next_expiry)
             }
         }
     }

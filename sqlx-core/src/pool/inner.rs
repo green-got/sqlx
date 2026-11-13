@@ -190,24 +190,24 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     /// Remove an idle connection that is past `idle_timeout` or `max_lifetime`, for the
-    /// maintenance task to close.
+    /// maintenance task to close. Otherwise returns when the next connection it checked expires,
+    /// so the task can wake up for it instead of a full period later.
     ///
     /// Connections that have not expired stay idle with their `idle_since` untouched, so
     /// repeated maintenance passes never extend how long a connection counts as idle. See
     /// [`IdleQueue::pop_expired`] for which connections each call checks.
-    fn try_acquire_expired(self: &Arc<Self>) -> Option<Floating<DB, Idle<DB>>> {
+    fn try_acquire_expired(self: &Arc<Self>) -> Result<Floating<DB, Idle<DB>>, Option<Instant>> {
         if self.is_closed() {
-            return None;
+            return Err(None);
         }
 
-        let permit = self.semaphore.try_acquire(1)?;
-        let idle = self.idle_conns.pop_expired(|idle| {
-            is_beyond_idle_timeout(idle, &self.options)
-                || is_beyond_max_lifetime(idle, &self.options)
-        })?;
+        let permit = self.semaphore.try_acquire(1).ok_or(None)?;
+        let idle = self
+            .idle_conns
+            .pop_expired(|idle| expires_at(idle, &self.options))?;
         self.decrement_num_idle();
 
-        Some(Floating::from_idle(idle, (*self).clone(), permit))
+        Ok(Floating::from_idle(idle, (*self).clone(), permit))
     }
 
     fn pop_idle<'a>(
@@ -497,11 +497,14 @@ pub(super) fn is_beyond_max_lifetime<DB: Database>(
         .is_some_and(|max| live.created_at.elapsed() > max)
 }
 
-/// Returns `true` if the connection has exceeded `options.idle_timeout` if set, `false` otherwise.
-fn is_beyond_idle_timeout<DB: Database>(idle: &Idle<DB>, options: &PoolOptions<DB>) -> bool {
-    options
+/// When the connection passes `options.idle_timeout` or `options.max_lifetime`, whichever is
+/// sooner, or `None` if neither is set.
+fn expires_at<DB: Database>(idle: &Idle<DB>, options: &PoolOptions<DB>) -> Option<Instant> {
+    let idle_expiry = options
         .idle_timeout
-        .is_some_and(|timeout| idle.idle_since.elapsed() > timeout)
+        .map(|timeout| idle.idle_since + timeout);
+    let lifetime_expiry = options.max_lifetime.map(|max| idle.live.created_at + max);
+    idle_expiry.into_iter().chain(lifetime_expiry).min()
 }
 
 async fn check_idle_conn<DB: Database>(
@@ -577,7 +580,10 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                         return;
                     }
 
-                    let next_run = Instant::now() + period;
+                    let period_end = Instant::now() + period;
+                    // Wake up when the next connection this pass saw expires. Ones it did not
+                    // see, such as those in use, are checked again by `period_end` at the latest.
+                    let mut next_run = period_end;
 
                     // Go over all idle connections, check for idleness and lifetime,
                     // and if we have fewer than min_connections after reaping a connection,
@@ -589,9 +595,13 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                     // synchronous, non-yielding loop spin unboundedly and starve the runtime.
                     let checks = cmp::min(pool.num_idle(), pool.options.max_connections as usize);
                     for _ in 0..checks {
-                        if let Some(conn) = pool.try_acquire_expired() {
-                            let _ = conn.close().await;
-                            pool.min_connections_maintenance(Some(next_run)).await;
+                        match pool.try_acquire_expired() {
+                            Ok(conn) => {
+                                let _ = conn.close().await;
+                                pool.min_connections_maintenance(Some(period_end)).await;
+                            }
+                            Err(Some(expiry)) => next_run = cmp::min(next_run, expiry),
+                            Err(None) => {}
                         }
                     }
 
@@ -884,7 +894,7 @@ mod tests {
                 released_at.elapsed() < IDLE_TIMEOUT * 20,
                 "{order:?}: idle connection outlived its idle timeout across maintenance passes"
             );
-            if let Some(conn) = inner.try_acquire_expired() {
+            if let Ok(conn) = inner.try_acquire_expired() {
                 drop(conn);
             }
             thread::sleep(IDLE_TIMEOUT / 10);
@@ -963,7 +973,7 @@ mod tests {
         inner.release(make_live(&inner, "c"));
 
         // The pool's own maintenance task may already have reaped "a".
-        while let Some(conn) = inner.try_acquire_expired() {
+        while let Ok(conn) = inner.try_acquire_expired() {
             assert_eq!(name_of(&conn), "a");
         }
 
@@ -975,5 +985,34 @@ mod tests {
             inner.try_acquire().is_none(),
             "the expired connection was not reaped"
         );
+    }
+
+    // The maintenance task sleeps until the earliest expiry it saw rather than a whole period,
+    // so a connection released just after a pass is not left open for nearly two periods.
+    #[test]
+    fn unexpired_connections_report_when_they_expire() {
+        const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+        const MAX_LIFETIME: Duration = Duration::from_secs(900);
+
+        for order in [IdleOrder::Fifo, IdleOrder::Lifo] {
+            let (_pool, inner) = stub_pool(
+                PoolOptions::new()
+                    .max_connections(2)
+                    .max_lifetime(MAX_LIFETIME)
+                    .idle_timeout(IDLE_TIMEOUT)
+                    .idle_order(order),
+            );
+            let before = Instant::now();
+            inner.release(make_live(&inner, "a"));
+            let after = Instant::now();
+
+            let Err(Some(expiry)) = inner.try_acquire_expired() else {
+                panic!("{order:?}: no expiry reported for an unexpired connection");
+            };
+            assert!(
+                before + IDLE_TIMEOUT <= expiry && expiry <= after + IDLE_TIMEOUT,
+                "{order:?}: expiry is not the idle timeout from release"
+            );
+        }
     }
 }
