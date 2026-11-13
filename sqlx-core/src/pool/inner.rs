@@ -189,6 +189,30 @@ impl<DB: Database> PoolInner<DB> {
         self.pop_idle(permit).ok()
     }
 
+    /// Remove an idle connection that is past `idle_timeout` or `max_lifetime`, for the
+    /// maintenance task to close.
+    ///
+    /// Each call checks the longest-idle connection; one still in its lifetime goes back to the
+    /// queue with its `idle_since` untouched, so repeated maintenance passes never extend how long
+    /// a connection counts as idle.
+    fn try_acquire_expired(self: &Arc<Self>) -> Option<Floating<DB, Idle<DB>>> {
+        if self.is_closed() {
+            return None;
+        }
+
+        let permit = self.semaphore.try_acquire(1)?;
+        let conn = self.pop_idle(permit).ok()?;
+
+        if is_beyond_idle_timeout(&conn, &self.options)
+            || is_beyond_max_lifetime(&conn, &self.options)
+        {
+            Some(conn)
+        } else {
+            self.release_idle(conn);
+            None
+        }
+    }
+
     fn pop_idle<'a>(
         self: &'a Arc<Self>,
         permit: AsyncSemaphoreReleaser<'a>,
@@ -211,7 +235,11 @@ impl<DB: Database> PoolInner<DB> {
     pub(super) fn release(&self, floating: Floating<DB, Live<DB>>) {
         // `options.after_release` and other checks are in `PoolConnection::return_to_pool()`.
 
-        let Floating { inner: idle, guard } = floating.into_idle();
+        self.release_idle(floating.into_idle());
+    }
+
+    fn release_idle(&self, floating: Floating<DB, Idle<DB>>) {
+        let Floating { inner: idle, guard } = floating;
 
         // Bump the idle counter *before* the connection becomes acquirable, so a concurrent
         // `pop_idle` can never observe a popped connection without a matching increment.
@@ -564,15 +592,9 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                     // synchronous, non-yielding loop spin unboundedly and starve the runtime.
                     let checks = cmp::min(pool.num_idle(), pool.options.max_connections as usize);
                     for _ in 0..checks {
-                        if let Some(conn) = pool.try_acquire() {
-                            if is_beyond_idle_timeout(&conn, &pool.options)
-                                || is_beyond_max_lifetime(&conn, &pool.options)
-                            {
-                                let _ = conn.close().await;
-                                pool.min_connections_maintenance(Some(next_run)).await;
-                            } else {
-                                pool.release(conn.into_live());
-                            }
+                        if let Some(conn) = pool.try_acquire_expired() {
+                            let _ = conn.close().await;
+                            pool.min_connections_maintenance(Some(next_run)).await;
                         }
                     }
 
@@ -644,7 +666,7 @@ impl<DB: Database> Drop for DecrementSizeGuard<DB> {
 // directly. (We can't use a real driver here: the only `Database` impls outside this crate
 // would be a different `sqlx-core` instance via the dev-dependency cycle.)
 #[cfg(all(test, feature = "any"))]
-mod underflow_tests {
+mod tests {
     use super::*;
     use crate::any::{
         Any, AnyArguments, AnyConnectOptions, AnyConnection, AnyConnectionBackend, AnyQueryResult,
@@ -658,7 +680,8 @@ mod underflow_tests {
     use std::str::FromStr;
 
     /// A backend that constructs but never executes anything. The pool's `release`/`pop_idle`
-    /// paths only move the opaque connection around — they never call any of these methods.
+    /// paths only move the opaque connection around — they never call any of these methods
+    /// besides `close`, which the maintenance task calls on connections it reaps.
     #[derive(Debug)]
     struct StubBackend;
 
@@ -667,7 +690,7 @@ mod underflow_tests {
             "stub"
         }
         fn close(self: Box<Self>) -> BoxFuture<'static, crate::Result<()>> {
-            unimplemented!()
+            Box::pin(async { Ok(()) })
         }
         fn close_hard(self: Box<Self>) -> BoxFuture<'static, crate::Result<()>> {
             unimplemented!()
@@ -813,5 +836,45 @@ mod underflow_tests {
 
         // Drain so the stub connections' size slots are released before the pool drops.
         while inner.try_acquire().is_some() {}
+    }
+
+    // The maintenance task used to put each unexpired connection back through `release`, which
+    // restarts its idle clock, so an unused connection survived up to twice `idle_timeout`.
+    // Sweeping several times per `idle_timeout` amplifies that into never reaping it; the
+    // connection must still be reaped once it has been idle for `idle_timeout`.
+    #[test]
+    fn maintenance_passes_do_not_extend_idle_timeout() {
+        use std::thread;
+
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+
+        let opts = AnyConnectOptions::from_str("stub::memory:").expect("parse url");
+        let pool: Pool<Any> = PoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .max_lifetime(None)
+            .idle_timeout(IDLE_TIMEOUT)
+            .connect_lazy_with(opts);
+        let inner = Arc::clone(&pool.0);
+
+        inner.release(make_live(&inner));
+        let released_at = Instant::now();
+
+        // The pool's own maintenance task may reap the connection too; either way it must go.
+        while inner.size() > 0 {
+            assert!(
+                released_at.elapsed() < IDLE_TIMEOUT * 20,
+                "idle connection outlived its idle timeout across maintenance passes"
+            );
+            if let Some(conn) = inner.try_acquire_expired() {
+                drop(conn);
+            }
+            thread::sleep(IDLE_TIMEOUT / 10);
+        }
+
+        assert!(
+            released_at.elapsed() >= IDLE_TIMEOUT,
+            "connection was reaped before its idle timeout"
+        );
     }
 }
