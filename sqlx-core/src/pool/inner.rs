@@ -20,7 +20,7 @@ use crate::pool::options::PoolConnectionMetadata;
 use crate::private_tracing_dynamic_event;
 use futures_util::FutureExt;
 use std::time::{Duration, Instant};
-use tracing::Level;
+use tracing::{Instrument, Level};
 
 pub(crate) struct PoolInner<DB: Database> {
     pub(super) connect_options: RwLock<Arc<<DB::Connection as Connection>::Options>>,
@@ -282,6 +282,11 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     pub(super) async fn acquire(self: &Arc<Self>) -> Result<Floating<DB, Live<DB>>, Error> {
+        let span = within_caller_span(|| tracing::info_span!(target: "sqlx::pool", "pool acquire"));
+        self.acquire_traced().instrument(span).await
+    }
+
+    async fn acquire_traced(self: &Arc<Self>) -> Result<Floating<DB, Live<DB>>, Error> {
         if self.is_closed() {
             return Err(Error::PoolClosed);
         }
@@ -361,6 +366,15 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     pub(super) async fn connect(
+        self: &Arc<Self>,
+        deadline: Instant,
+        guard: DecrementSizeGuard<DB>,
+    ) -> Result<Floating<DB, Live<DB>>, Error> {
+        let span = within_caller_span(|| tracing::info_span!(target: "sqlx::pool", "pool connect"));
+        self.connect_traced(deadline, guard).instrument(span).await
+    }
+
+    async fn connect_traced(
         self: &Arc<Self>,
         deadline: Instant,
         guard: DecrementSizeGuard<DB>,
@@ -473,6 +487,16 @@ impl<DB: Database> PoolInner<DB> {
             }
             Err(error) => tracing::debug!(%error, "error while maintaining min_connections"),
         }
+    }
+}
+
+/// A span for the pool's own work only beneath the caller's span, where it explains the caller's
+/// time: on its own, such as `min_connections` maintenance, each one would start a trace of its own.
+fn within_caller_span(span: impl FnOnce() -> tracing::Span) -> tracing::Span {
+    if tracing::Span::current().is_none() {
+        tracing::Span::none()
+    } else {
+        span()
     }
 }
 
