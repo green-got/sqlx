@@ -232,7 +232,9 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     /// Remove an idle connection that is past `idle_timeout` or `max_lifetime`, for the
-    /// maintenance task to close. Otherwise returns when the next connection it checked expires,
+    /// maintenance task to close. `idle_timeout` only applies while the pool holds more than
+    /// `min_connections`: closing a connection the pool must keep would only open another in
+    /// its place, so those are retired by `max_lifetime` alone. Otherwise returns when the next connection it checked expires,
     /// so the task can wake up for it instead of a full period later.
     ///
     /// Connections that have not expired stay idle with their `idle_since` untouched, so
@@ -244,9 +246,14 @@ impl<DB: Database> PoolInner<DB> {
         }
 
         let permit = self.semaphore.try_acquire(1).ok_or(None)?;
+        let idle_timeout = if self.size() > self.min_connections() {
+            self.idle_timeout()
+        } else {
+            None
+        };
         let idle = self
             .idle_conns
-            .pop_expired(|idle| expires_at(idle, self.idle_timeout(), self.options.max_lifetime))?;
+            .pop_expired(|idle| expires_at(idle, idle_timeout, self.options.max_lifetime))?;
         self.decrement_num_idle();
 
         Ok(Floating::from_idle(idle, (*self).clone(), permit))
@@ -1184,5 +1191,65 @@ mod tests {
         )
         .expect("a pool kept at zero connections opens none");
         assert_eq!(inner.size(), 0);
+    }
+
+    // Closing an idle connection the pool must keep only opens another in its place: with an
+    // idle timeout shorter than the lifetime, warm connections were reopened every idle timeout.
+    #[test]
+    fn idle_timeout_only_closes_connections_above_the_minimum() {
+        use std::thread;
+
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(50);
+
+        let (_pool, inner) = stub_pool(
+            PoolOptions::new()
+                .max_connections(3)
+                .max_lifetime(None)
+                .idle_timeout(IDLE_TIMEOUT),
+        );
+        inner.min_connections.store(2, Ordering::Release);
+        for name in ["a", "b", "c"] {
+            inner.release(make_live(&inner, name));
+        }
+
+        let released_at = Instant::now();
+        while inner.size() > 2 {
+            assert!(
+                released_at.elapsed() < IDLE_TIMEOUT * 40,
+                "the connection above the minimum outlived its idle timeout"
+            );
+            thread::sleep(IDLE_TIMEOUT / 5);
+        }
+        thread::sleep(IDLE_TIMEOUT * 4);
+        assert_eq!(inner.size(), 2, "connections the pool keeps were closed");
+        assert!(matches!(inner.try_acquire_expired(), Err(None)));
+    }
+
+    #[test]
+    fn connections_the_pool_keeps_still_retire_at_their_lifetime() {
+        use std::thread;
+
+        const MAX_LIFETIME: Duration = Duration::from_millis(100);
+
+        let (_pool, inner) = stub_pool(
+            PoolOptions::new()
+                .max_connections(2)
+                .max_lifetime(MAX_LIFETIME)
+                .idle_timeout(Duration::from_millis(10)),
+        );
+        inner.min_connections.store(2, Ordering::Release);
+        inner.release(make_live(&inner, "a"));
+        inner.release(make_live(&inner, "b"));
+
+        // The stub cannot connect, so replacements never become idle.
+        let released_at = Instant::now();
+        while inner.num_idle() > 0 {
+            assert!(
+                released_at.elapsed() < MAX_LIFETIME * 20,
+                "a connection the pool keeps outlived its lifetime"
+            );
+            thread::sleep(MAX_LIFETIME / 5);
+        }
+        assert!(released_at.elapsed() >= MAX_LIFETIME / 2);
     }
 }
