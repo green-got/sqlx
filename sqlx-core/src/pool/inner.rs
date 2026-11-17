@@ -37,6 +37,8 @@ pub(crate) struct PoolInner<DB: Database> {
     idle_timeout_nanos: AtomicU64,
     /// Wakes the maintenance task so a changed setting applies before its next scheduled pass.
     maintenance_wake: event_listener::Event,
+    /// Set while a task spawned by [`PoolInner::spawn_min_connections_maintenance`] runs.
+    replenishing: AtomicBool,
     pub(super) options: PoolOptions<DB>,
     pub(crate) acquire_time_level: Option<Level>,
     pub(crate) acquire_slow_level: Option<Level>,
@@ -69,6 +71,7 @@ impl<DB: Database> PoolInner<DB> {
             min_connections: AtomicU32::new(options.min_connections),
             idle_timeout_nanos: AtomicU64::new(idle_timeout_nanos(options.idle_timeout)),
             maintenance_wake: event_listener::Event::new(),
+            replenishing: AtomicBool::new(false),
             acquire_time_level: private_level_filter_to_trace_level(options.acquire_time_level),
             acquire_slow_level: private_level_filter_to_trace_level(options.acquire_slow_level),
             options,
@@ -511,6 +514,31 @@ impl<DB: Database> PoolInner<DB> {
         Ok(())
     }
 
+    /// Maintains `min_connections` in a task of its own, unless one already runs, so the caller
+    /// never waits on connecting: a server refusing connections can hold an attempt until its
+    /// deadline, and the maintenance task must keep closing idle connections meanwhile.
+    fn spawn_min_connections_maintenance(self: &Arc<Self>, deadline: Instant) {
+        if self.size() >= self.min_connections() || self.replenishing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        /// Clears `replenishing` however the task ends, so a cancelled one cannot stop the next.
+        struct Replenishing<DB: Database>(Arc<PoolInner<DB>>);
+
+        impl<DB: Database> Drop for Replenishing<DB> {
+            fn drop(&mut self) {
+                self.0.replenishing.store(false, Ordering::Release);
+            }
+        }
+
+        let replenishing = Replenishing(Arc::clone(self));
+        crate::rt::spawn(async move {
+            replenishing
+                .0
+                .min_connections_maintenance(Some(deadline))
+                .await;
+        });
+    }
+
     /// Attempt to maintain `min_connections`, logging if unable.
     pub async fn min_connections_maintenance(self: &Arc<Self>, deadline: Option<Instant>) {
         let deadline = deadline.unwrap_or_else(|| {
@@ -674,17 +702,17 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                         match pool.try_acquire_expired() {
                             Ok(conn) => {
                                 let _ = conn.close().await;
-                                pool.min_connections_maintenance(Some(period_end)).await;
                             }
                             Err(Some(expiry)) => next_run = cmp::min(next_run, expiry),
                             Err(None) => {}
                         }
                     }
 
-                    // Also top up a pool that is short of its minimum without having reaped
-                    // anything, such as one whose minimum was raised while connecting failed,
-                    // so a failed attempt is retried on the next pass rather than never.
-                    pool.min_connections_maintenance(Some(period_end)).await;
+                    // Replace what this pass closed, and top up a pool short of its minimum
+                    // without having reaped anything, such as one whose minimum was raised while
+                    // connecting failed, so a failed attempt is retried on the next pass. It runs
+                    // apart from this task, which a refused connection must not hold up.
+                    pool.spawn_min_connections_maintenance(period_end);
 
                     // Don't hold a reference to the pool while sleeping.
                     drop(pool);
