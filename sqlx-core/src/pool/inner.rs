@@ -531,11 +531,14 @@ impl<DB: Database> PoolInner<DB> {
         }
 
         let replenishing = Replenishing(Arc::clone(self));
+        // Cancelled when the pool closes: `close()` waits for every permit, which an attempt
+        // the server keeps refusing would otherwise hold until its deadline.
+        let mut close_event = self.close_event();
         crate::rt::spawn(async move {
-            replenishing
-                .0
-                .min_connections_maintenance(Some(deadline))
+            let _ = close_event
+                .do_until(replenishing.0.min_connections_maintenance(Some(deadline)))
                 .await;
+            drop(replenishing);
         });
     }
 
@@ -702,16 +705,19 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                         match pool.try_acquire_expired() {
                             Ok(conn) => {
                                 let _ = conn.close().await;
+                                // Replace it at once, so a batch of warm connections expiring
+                                // together does not leave the pool cold while this pass goes on.
+                                pool.spawn_min_connections_maintenance(period_end);
                             }
                             Err(Some(expiry)) => next_run = cmp::min(next_run, expiry),
                             Err(None) => {}
                         }
                     }
 
-                    // Replace what this pass closed, and top up a pool short of its minimum
-                    // without having reaped anything, such as one whose minimum was raised while
-                    // connecting failed, so a failed attempt is retried on the next pass. It runs
-                    // apart from this task, which a refused connection must not hold up.
+                    // Also top up a pool short of its minimum without having reaped anything, such
+                    // as one whose minimum was raised while connecting failed, so a failed
+                    // attempt is retried on the next pass. It runs apart from this task, which a
+                    // refused connection must not hold up.
                     pool.spawn_min_connections_maintenance(period_end);
 
                     // Don't hold a reference to the pool while sleeping.
