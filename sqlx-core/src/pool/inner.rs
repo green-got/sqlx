@@ -11,7 +11,7 @@ use crate::sync::{AsyncSemaphore, AsyncSemaphoreReleaser};
 use std::cmp;
 use std::future::{self, Future};
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
@@ -30,6 +30,13 @@ pub(crate) struct PoolInner<DB: Database> {
     pub(super) num_idle: AtomicUsize,
     is_closed: AtomicBool,
     pub(super) on_closed: event_listener::Event,
+    /// `options.min_connections` until [`Pool::set_min_connections`] changes it.
+    min_connections: AtomicU32,
+    /// `options.idle_timeout` in nanoseconds, or [`NO_IDLE_TIMEOUT`], until
+    /// [`Pool::set_idle_timeout`] changes it.
+    idle_timeout_nanos: AtomicU64,
+    /// Wakes the maintenance task so a changed setting applies before its next scheduled pass.
+    maintenance_wake: event_listener::Event,
     pub(super) options: PoolOptions<DB>,
     pub(crate) acquire_time_level: Option<Level>,
     pub(crate) acquire_slow_level: Option<Level>,
@@ -59,6 +66,9 @@ impl<DB: Database> PoolInner<DB> {
             num_idle: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
             on_closed: event_listener::Event::new(),
+            min_connections: AtomicU32::new(options.min_connections),
+            idle_timeout_nanos: AtomicU64::new(idle_timeout_nanos(options.idle_timeout)),
+            maintenance_wake: event_listener::Event::new(),
             acquire_time_level: private_level_filter_to_trace_level(options.acquire_time_level),
             acquire_slow_level: private_level_filter_to_trace_level(options.acquire_slow_level),
             options,
@@ -73,6 +83,35 @@ impl<DB: Database> PoolInner<DB> {
 
     pub(super) fn size(&self) -> u32 {
         self.size.load(Ordering::Acquire)
+    }
+
+    pub(super) fn min_connections(&self) -> u32 {
+        self.min_connections.load(Ordering::Acquire)
+    }
+
+    pub(super) fn idle_timeout(&self) -> Option<Duration> {
+        match self.idle_timeout_nanos.load(Ordering::Acquire) {
+            NO_IDLE_TIMEOUT => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// Lowering it closes nothing by itself: idle connections above it close as they expire.
+    /// Raising it opens the missing connections in the background.
+    pub(super) fn set_min_connections(self: &Arc<Self>, min_connections: u32) {
+        let min_connections = cmp::min(min_connections, self.options.max_connections);
+        let previous = self.min_connections.swap(min_connections, Ordering::AcqRel);
+        if min_connections > previous && !self.is_closed() {
+            let pool = Arc::clone(self);
+            crate::rt::spawn(async move { pool.min_connections_maintenance(None).await });
+        }
+    }
+
+    /// Applies to connections already idle, counting from when each became idle.
+    pub(super) fn set_idle_timeout(&self, idle_timeout: Option<Duration>) {
+        self.idle_timeout_nanos
+            .store(idle_timeout_nanos(idle_timeout), Ordering::Release);
+        self.maintenance_wake.notify(usize::MAX);
     }
 
     pub(super) fn num_idle(&self) -> usize {
@@ -204,7 +243,7 @@ impl<DB: Database> PoolInner<DB> {
         let permit = self.semaphore.try_acquire(1).ok_or(None)?;
         let idle = self
             .idle_conns
-            .pop_expired(|idle| expires_at(idle, &self.options))?;
+            .pop_expired(|idle| expires_at(idle, self.idle_timeout(), self.options.max_lifetime))?;
         self.decrement_num_idle();
 
         Ok(Floating::from_idle(idle, (*self).clone(), permit))
@@ -450,7 +489,7 @@ impl<DB: Database> PoolInner<DB> {
 
     /// Try to maintain `min_connections`, returning any errors (including `PoolTimedOut`).
     pub async fn try_min_connections(self: &Arc<Self>, deadline: Instant) -> Result<(), Error> {
-        while self.size() < self.options.min_connections {
+        while self.size() < self.min_connections() {
             // Don't wait for a semaphore permit.
             //
             // If no extra permits are available then we shouldn't be trying to spin up
@@ -521,13 +560,26 @@ pub(super) fn is_beyond_max_lifetime<DB: Database>(
         .is_some_and(|max| live.created_at.elapsed() > max)
 }
 
-/// When the connection passes `options.idle_timeout` or `options.max_lifetime`, whichever is
-/// sooner, or `None` if neither is set.
-fn expires_at<DB: Database>(idle: &Idle<DB>, options: &PoolOptions<DB>) -> Option<Instant> {
-    let idle_expiry = options
-        .idle_timeout
-        .map(|timeout| idle.idle_since + timeout);
-    let lifetime_expiry = options.max_lifetime.map(|max| idle.live.created_at + max);
+/// Stands for no idle timeout in `PoolInner::idle_timeout_nanos`.
+const NO_IDLE_TIMEOUT: u64 = u64::MAX;
+
+fn idle_timeout_nanos(idle_timeout: Option<Duration>) -> u64 {
+    idle_timeout.map_or(NO_IDLE_TIMEOUT, |timeout| {
+        u64::try_from(timeout.as_nanos()).map_or(NO_IDLE_TIMEOUT - 1, |nanos| {
+            cmp::min(nanos, NO_IDLE_TIMEOUT - 1)
+        })
+    })
+}
+
+/// When the connection passes `idle_timeout` or `max_lifetime`, whichever is sooner, or `None`
+/// if neither is set.
+fn expires_at<DB: Database>(
+    idle: &Idle<DB>,
+    idle_timeout: Option<Duration>,
+    max_lifetime: Option<Duration>,
+) -> Option<Instant> {
+    let idle_expiry = idle_timeout.map(|timeout| idle.idle_since + timeout);
+    let lifetime_expiry = max_lifetime.map(|max| idle.live.created_at + max);
     idle_expiry.into_iter().chain(lifetime_expiry).min()
 }
 
@@ -574,24 +626,6 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
     // so they don't keep `PoolInner` from being dropped.
     let pool_weak = Arc::downgrade(pool);
 
-    let period = match (pool.options.max_lifetime, pool.options.idle_timeout) {
-        (Some(it), None) | (None, Some(it)) => it,
-
-        (Some(a), Some(b)) => cmp::min(a, b),
-
-        (None, None) => {
-            if pool.options.min_connections > 0 {
-                crate::rt::spawn(async move {
-                    if let Some(pool) = pool_weak.upgrade() {
-                        pool.min_connections_maintenance(None).await;
-                    }
-                });
-            }
-
-            return;
-        }
-    };
-
     // Immediately cancel this task if the pool is closed.
     let mut close_event = pool.close_event();
 
@@ -603,6 +637,24 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                     if pool.is_closed() {
                         return;
                     }
+
+                    // Listen before the pass, so a setting changed during it wakes the next one.
+                    let woken = pool.maintenance_wake.listen();
+
+                    // Read on every pass, since `Pool::set_idle_timeout` may have changed it.
+                    let period = match (pool.options.max_lifetime, pool.idle_timeout()) {
+                        (Some(it), None) | (None, Some(it)) => Some(it),
+                        (Some(a), Some(b)) => Some(cmp::min(a, b)),
+                        (None, None) => None,
+                    };
+
+                    let Some(period) = period else {
+                        // Nothing expires: only keep `min_connections`, until a setting changes.
+                        pool.min_connections_maintenance(None).await;
+                        drop(pool);
+                        woken.await;
+                        continue;
+                    };
 
                     let period_end = Instant::now() + period;
                     // Wake up when the next connection this pass saw expires. Ones it did not
@@ -634,7 +686,7 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
 
                     if let Some(duration) = next_run.checked_duration_since(Instant::now()) {
                         // `async-std` doesn't have a `sleep_until()`
-                        crate::rt::sleep(duration).await;
+                        let _ = crate::rt::timeout(duration, woken).await;
                     } else {
                         // `next_run` is in the past, just yield.
                         crate::rt::yield_now().await;
@@ -1038,5 +1090,60 @@ mod tests {
                 "{order:?}: expiry is not the idle timeout from release"
             );
         }
+    }
+
+    // A process that stops serving shortens its pool's idle timeout to let go of connections it
+    // no longer needs: the maintenance task, asleep until the old timeout, must apply the new
+    // one to connections already idle.
+    #[test]
+    fn a_shorter_idle_timeout_closes_connections_already_idle() {
+        use std::thread;
+
+        const SHORT_IDLE_TIMEOUT: Duration = Duration::from_millis(50);
+
+        let (pool, inner) = stub_pool(
+            PoolOptions::new()
+                .max_connections(2)
+                .max_lifetime(None)
+                .idle_timeout(Duration::from_secs(600)),
+        );
+        inner.release(make_live(&inner, "a"));
+        inner.release(make_live(&inner, "b"));
+        // Let the maintenance task pass over them and go to sleep until they would expire.
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(inner.size(), 2);
+
+        pool.set_idle_timeout(SHORT_IDLE_TIMEOUT);
+        assert_eq!(pool.idle_timeout(), Some(SHORT_IDLE_TIMEOUT));
+        assert_eq!(
+            pool.options().get_idle_timeout(),
+            Some(Duration::from_secs(600))
+        );
+
+        let changed_at = Instant::now();
+        while inner.size() > 0 {
+            assert!(
+                changed_at.elapsed() < SHORT_IDLE_TIMEOUT * 40,
+                "idle connections outlived the shortened idle timeout"
+            );
+            thread::sleep(SHORT_IDLE_TIMEOUT / 5);
+        }
+    }
+
+    #[test]
+    fn a_lowered_minimum_opens_no_connections() {
+        let (pool, inner) = stub_pool(PoolOptions::new().max_connections(4));
+        // Built warm, the way `min_connections` would be set for a serving pool.
+        inner.min_connections.store(4, Ordering::Release);
+
+        pool.set_min_connections(0);
+        assert_eq!(pool.min_connections(), 0);
+
+        // The stub cannot connect, so any attempt to open a connection would fail.
+        crate::rt::test_block_on(
+            inner.try_min_connections(Instant::now() + Duration::from_secs(1)),
+        )
+        .expect("a pool kept at zero connections opens none");
+        assert_eq!(inner.size(), 0);
     }
 }

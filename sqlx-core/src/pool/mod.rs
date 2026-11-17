@@ -567,8 +567,42 @@ impl<DB: Database> Pool<DB> {
     }
 
     /// Get the options for this pool
+    ///
+    /// They are the options the pool was built with: [`Pool::min_connections`] and
+    /// [`Pool::idle_timeout`] report the settings in effect now.
     pub fn options(&self) -> &PoolOptions<DB> {
         &self.0.options
+    }
+
+    /// The number of connections the pool keeps open now: [`PoolOptions::min_connections`]
+    /// until [`Pool::set_min_connections`] changes it.
+    pub fn min_connections(&self) -> u32 {
+        self.0.min_connections()
+    }
+
+    /// Changes how many connections the pool keeps open, capped at `max_connections`.
+    ///
+    /// Lowering it closes no connection by itself: idle connections beyond it close once they
+    /// pass the idle timeout or their lifetime. Raising it opens the missing connections in the
+    /// background. Useful for a process that stops serving, such as one being replaced, to
+    /// stop holding connections it no longer needs, and to warm them again if it resumes.
+    pub fn set_min_connections(&self, min_connections: u32) {
+        self.0.set_min_connections(min_connections);
+    }
+
+    /// How long a connection may stay idle now: [`PoolOptions::idle_timeout`] until
+    /// [`Pool::set_idle_timeout`] changes it.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.0.idle_timeout()
+    }
+
+    /// Changes how long a connection may stay idle before the pool closes it.
+    ///
+    /// It applies to connections already idle, counting from when each became idle, and wakes
+    /// the maintenance task, so a shorter timeout closes connections without waiting for the
+    /// previous one. Connections the pool keeps for [`Pool::min_connections`] are opened again.
+    pub fn set_idle_timeout(&self, idle_timeout: impl Into<Option<Duration>>) {
+        self.0.set_idle_timeout(idle_timeout.into());
     }
 }
 

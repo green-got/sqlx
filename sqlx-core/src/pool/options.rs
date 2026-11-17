@@ -578,7 +578,7 @@ impl<DB: Database> PoolOptions<DB> {
 
         let inner = PoolInner::new_arc(self, options);
 
-        if inner.options.min_connections > 0 {
+        if inner.min_connections() > 0 {
             // If the idle reaper is spawned then this will race with the call from that task
             // and may not report any connection errors.
             inner.try_min_connections(deadline).await?;
