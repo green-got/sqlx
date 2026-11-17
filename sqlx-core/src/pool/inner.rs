@@ -681,6 +681,11 @@ fn spawn_maintenance_tasks<DB: Database>(pool: &Arc<PoolInner<DB>>) {
                         }
                     }
 
+                    // Also top up a pool that is short of its minimum without having reaped
+                    // anything, such as one whose minimum was raised while connecting failed,
+                    // so a failed attempt is retried on the next pass rather than never.
+                    pool.min_connections_maintenance(Some(period_end)).await;
+
                     // Don't hold a reference to the pool while sleeping.
                     drop(pool);
 
