@@ -639,8 +639,10 @@ async fn check_idle_conn<DB: Database>(
     options: &PoolOptions<DB>,
 ) -> Result<Floating<DB, Live<DB>>, DecrementSizeGuard<DB>> {
     if options.test_before_acquire {
-        // Check that the connection is still live
-        if let Err(error) = conn.ping().await {
+        // Check that the connection is still live. Its own span: a ping an unresponsive session
+        // never answers can take the whole acquire timeout, with a connection available.
+        let span = within_caller_span(|| tracing::info_span!(target: "sqlx::pool", "pool idle check"));
+        if let Err(error) = conn.ping().instrument(span).await {
             // an error here means the other end has hung up or we lost connectivity
             // either way we're fine to just discard the connection
             // the error itself here isn't necessarily unexpected so WARN is too strong
