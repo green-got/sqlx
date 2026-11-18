@@ -475,11 +475,24 @@ impl<DB: Database> PoolInner<DB> {
                     }
                 }
 
-                // an IO error while connecting is assumed to be the system starting up
-                Ok(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionRefused => (),
+                // An IO error while connecting is assumed to be the system starting up. Each
+                // refusal is logged as it happens: the acquire's own timeout drops this future
+                // at the deadline, so a caller would otherwise see only `PoolTimedOut`.
+                Ok(Err(Error::Io(error)))
+                    if error.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
+                    tracing::warn!(target: "sqlx::pool", %error, "connection refused; retrying");
+                }
 
                 // We got a transient database error, retry.
-                Ok(Err(Error::Database(error))) if error.is_transient_in_connect_phase() => (),
+                Ok(Err(Error::Database(error))) if error.is_transient_in_connect_phase() => {
+                    tracing::warn!(
+                        target: "sqlx::pool",
+                        %error,
+                        code = error.code().as_deref(),
+                        "connection refused; retrying"
+                    );
+                }
 
                 // Any other error while connection should immediately
                 // terminate and bubble the error up
